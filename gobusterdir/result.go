@@ -23,6 +23,7 @@ type Result struct {
 	Header     http.Header
 	StatusCode int
 	Size       int64
+	ClusterID  int
 }
 
 // ResultToString converts the Result to its textual representation
@@ -57,6 +58,12 @@ func (r Result) ResultToString() (string, error) {
 	location := r.Header.Get("Location")
 	if location != "" {
 		blue(buf, " [--> %s]", location)
+	}
+
+	if r.ClusterID > 0 {
+		if _, err := fmt.Fprintf(buf, " [Cluster: %d]", r.ClusterID); err != nil {
+			return "", err
+		}
 	}
 
 	if _, err := fmt.Fprintf(buf, "\n"); err != nil {

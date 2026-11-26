@@ -129,7 +129,22 @@ gobuster dir -u https://example.com -w wordlist.txt -l
 
 # Filter by status codes
 gobuster dir -u https://example.com -w wordlist.txt -s 200,301,302
+
+# SPA fallback routes are detected and filtered automatically (default)
+gobuster dir -u https://example.com -w wordlist.txt --soft-404-threshold 0.92
+
+# Group similar successful responses without removing unique paths
+gobuster dir -u https://example.com -w wordlist.txt --cluster
+
+# Disable automatic soft-404 detection or duplicate removal
+gobuster dir -u https://example.com -w wordlist.txt --no-soft-404 --no-dedupe
 ```
+
+Directory mode fingerprints several random non-existing paths before scanning. Responses that match the normalized
+fallback fingerprint (body structure, content type, status, redirect target and normalized dynamic values) are treated
+as soft 404s and omitted from the results. This keeps normal status-code, `--exclude-length`, extension, slash and
+wordlist-pattern behavior unchanged. Duplicate result URLs are removed by default. With `--cluster`, each result gets a
+similarity cluster ID such as `[Cluster: 1]`; clustering is informational and does not discard unique paths.
 
 #### 🔍 DNS Mode (`dns`)
 

@@ -36,6 +36,13 @@ func getFlags() []cli.Flag {
 		&cli.BoolFlag{Name: "discover-backup", Aliases: []string{"db"}, Value: false, Usage: "Upon finding a file search for backup files by appending multiple backup extensions"},
 		&cli.StringFlag{Name: "exclude-length", Aliases: []string{"xl"}, Usage: "exclude the following content lengths (completely ignores the status). You can separate multiple lengths by comma and it also supports ranges like 203-206"},
 		&cli.BoolFlag{Name: "force", Value: false, Usage: "Continue even if the prechecks fail. Please only use this if you know what you are doing, it can lead to unexpected results."},
+		&cli.BoolFlag{Name: "soft-404", Aliases: []string{"s404", "soft404", "detect-soft-404"}, Value: true, Usage: "Detect SPA soft-404 responses by comparing normalized response fingerprints"},
+		&cli.BoolFlag{Name: "no-soft-404", Value: false, Usage: "Disable automatic soft-404 fingerprint detection"},
+		&cli.Float64Flag{Name: "soft-404-threshold", Aliases: []string{"s404t", "soft404-threshold"}, Value: gobusterdir.DefaultSoft404Threshold, Usage: "Similarity threshold for soft-404 detection (0-1)"},
+		&cli.BoolFlag{Name: "cluster", Aliases: []string{"clusters", "cluster-results"}, Value: false, Usage: "Annotate results with similarity cluster IDs"},
+		&cli.Float64Flag{Name: "cluster-threshold", Aliases: []string{"cluster-similarity"}, Value: gobusterdir.DefaultClusterThreshold, Usage: "Similarity threshold for result clustering (0-1)"},
+		&cli.BoolFlag{Name: "dedupe", Aliases: []string{"deduplicate"}, Value: true, Usage: "Remove duplicate result URLs"},
+		&cli.BoolFlag{Name: "no-dedupe", Aliases: []string{"no-deduplicate"}, Value: false, Usage: "Keep duplicate result URLs"},
 	}...)
 	return flags
 }
@@ -94,12 +101,24 @@ func run(c *cli.Context) error {
 	pluginOpts.HideLength = c.Bool("hide-length")
 	pluginOpts.DiscoverBackup = c.Bool("discover-backup")
 	pluginOpts.Force = c.Bool("force")
+	pluginOpts.Soft404Detection = c.Bool("soft-404") && !c.Bool("no-soft-404")
+	pluginOpts.Soft404Threshold = c.Float64("soft-404-threshold")
+	pluginOpts.Deduplicate = c.Bool("dedupe") && !c.Bool("no-dedupe")
+	pluginOpts.Cluster = c.Bool("cluster")
+	pluginOpts.ClusterThreshold = c.Float64("cluster-threshold")
 	pluginOpts.ExcludeLength = c.String("exclude-length")
 	ret4, err := libgobuster.ParseCommaSeparatedInt(pluginOpts.ExcludeLength)
 	if err != nil {
 		return fmt.Errorf("invalid value for exclude-length: %w", err)
 	}
 	pluginOpts.ExcludeLengthParsed = ret4
+
+	if pluginOpts.Soft404Threshold <= 0 || pluginOpts.Soft404Threshold > 1 {
+		return errors.New("soft-404-threshold must be greater than 0 and less than or equal to 1")
+	}
+	if pluginOpts.ClusterThreshold <= 0 || pluginOpts.ClusterThreshold > 1 {
+		return errors.New("cluster-threshold must be greater than 0 and less than or equal to 1")
+	}
 
 	globalOpts, err := internalcli.ParseGlobalOptions(c)
 	if err != nil {

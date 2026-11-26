@@ -1,0 +1,17 @@
+{
+  "root": "/home/dev/feedback/uid43111",
+  "B": "/home/dev/feedback/uid43111",
+  "sha": "764e8702012ce6faddc66904229894166a670b8a",
+  "wslDistro": "Ubuntu-26.04",
+  "source": {
+    "owner": "OJ",
+    "repo": "gobuster",
+    "sha": "764e8702012ce6faddc66904229894166a670b8a"
+  },
+  "fork": {
+    "owner": "Rrr119",
+    "repo": "gobuster",
+    "cloneUrl": "https://github.com/Rrr119/gobuster.git"
+  },
+  "at": "2026-11-26T18:36:28.145Z"
+}

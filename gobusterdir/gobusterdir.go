@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"syscall"
 	"text/tabwriter"
 	"unicode/utf8"
@@ -48,6 +50,11 @@ type GobusterDir struct {
 	options    *OptionsDir
 	globalopts *libgobuster.Options
 	http       *libgobuster.HTTPClient
+
+	resultMu       sync.Mutex
+	seenResults    map[string]struct{}
+	soft404        *Soft404Detector
+	resultClusters *ResultClusterer
 }
 
 // New creates a new initialized GobusterDir
@@ -61,8 +68,11 @@ func New(globalopts *libgobuster.Options, opts *OptionsDir, logger *libgobuster.
 	}
 
 	g := GobusterDir{
-		options:    opts,
-		globalopts: globalopts,
+		options:        opts,
+		globalopts:     globalopts,
+		seenResults:    make(map[string]struct{}),
+		soft404:        nil,
+		resultClusters: NewResultClusterer(opts.ClusterThreshold),
 	}
 
 	basicOptions := libgobuster.BasicHTTPOptions{
@@ -102,8 +112,22 @@ func (d *GobusterDir) Name() string {
 	return "directory enumeration"
 }
 
+type preflightResponse struct {
+	url        url.URL
+	statusCode int
+	length     int64
+	header     http.Header
+	body       []byte
+}
+
 // PreRun is the pre run implementation of gobusterdir
 func (d *GobusterDir) PreRun(ctx context.Context, pr *libgobuster.Progress) error {
+	d.resultMu.Lock()
+	d.seenResults = make(map[string]struct{})
+	d.resultMu.Unlock()
+	d.soft404 = nil
+	d.resultClusters = NewResultClusterer(d.options.ClusterThreshold)
+
 	// add trailing slash
 	if !strings.HasSuffix(d.options.URL.Path, "/") {
 		d.options.URL.Path = fmt.Sprintf("%s/", d.options.URL.Path)
@@ -132,55 +156,111 @@ func (d *GobusterDir) PreRun(ctx context.Context, pr *libgobuster.Progress) erro
 		}
 	}
 
-	guid := uuid.New()
-	url := *d.options.URL
-	url.Path = fmt.Sprintf("%s%s", url.Path, guid)
-	if d.options.UseSlash {
-		url.Path = fmt.Sprintf("%s/", url.Path)
+	probeCount := 1
+	if d.options.Soft404Detection {
+		probeCount = defaultSoft404Probes
 	}
 
-	wildcardResp, wildcardLength, wildcardHeader, _, err := d.http.Request(ctx, url, libgobuster.RequestOptions{})
-	if err != nil {
-		var retErr error
-		switch {
-		case errors.Is(err, io.EOF):
-			retErr = libgobuster.ErrEOF
-		case os.IsTimeout(err):
-			retErr = libgobuster.ErrTimeout
-		case errors.Is(err, syscall.ECONNREFUSED):
-			retErr = libgobuster.ErrConnectionRefused
-		default:
-			retErr = fmt.Errorf("unable to connect to %s: %w", url.String(), err)
+	probes := make([]preflightResponse, 0, probeCount)
+	for range probeCount {
+		guid := uuid.New()
+		url := *d.options.URL
+		url.Path = fmt.Sprintf("%s%s", url.Path, guid)
+		if d.options.UseSlash {
+			url.Path = fmt.Sprintf("%s/", url.Path)
 		}
-		if !d.options.Force {
-			return retErr
+
+		statusCode, length, header, body, err := d.http.Request(ctx, url, libgobuster.RequestOptions{
+			ReturnBody: d.options.Soft404Detection,
+		})
+		if err != nil {
+			var retErr error
+			switch {
+			case errors.Is(err, io.EOF):
+				retErr = libgobuster.ErrEOF
+			case os.IsTimeout(err):
+				retErr = libgobuster.ErrTimeout
+			case errors.Is(err, syscall.ECONNREFUSED):
+				retErr = libgobuster.ErrConnectionRefused
+			default:
+				retErr = fmt.Errorf("unable to connect to %s: %w", url.String(), err)
+			}
+			if !d.options.Force {
+				return retErr
+			}
+			if pr != nil {
+				pr.MessageChan <- libgobuster.Message{
+					Level:   libgobuster.LevelWarn,
+					Message: fmt.Sprintf("PreRun failed with error: %s. Continuing because force is set.", retErr),
+				}
+			}
+			continue
 		}
-		// if force is set, we continue even if the preRun fails
-		pr.MessageChan <- libgobuster.Message{
-			Level:   libgobuster.LevelWarn,
-			Message: fmt.Sprintf("PreRun failed with error: %s. Continuing because force is set.", retErr),
-		}
+
+		probes = append(probes, preflightResponse{
+			url:        url,
+			statusCode: statusCode,
+			length:     length,
+			header:     header,
+			body:       body,
+		})
 	}
 
-	if d.options.ExcludeLengthParsed.Contains(int(wildcardLength)) {
-		// we are done and ignore the request as the length is excluded
+	if len(probes) == 0 {
 		return nil
 	}
 
+	allProbesExcluded := true
+	for _, probe := range probes {
+		if !d.options.ExcludeLengthParsed.Contains(int(probe.length)) {
+			allProbesExcluded = false
+			break
+		}
+	}
+	if allProbesExcluded {
+		// the whole response length is excluded, so no wildcard handling is needed
+		return nil
+	}
+
+	if d.options.Soft404Detection {
+		samples := make([]ResponseFingerprint, 0, len(probes))
+		for _, probe := range probes {
+			if d.shouldReportStatus(probe.statusCode) {
+				samples = append(samples, NewResponseFingerprint(probe.statusCode, probe.body, probe.header, probe.url.Path))
+			}
+		}
+
+		d.soft404 = NewSoft404Detector(samples, d.options.Soft404Threshold)
+		if d.soft404 != nil {
+			return nil
+		}
+	}
+
+	wildcard := probes[0]
 	switch {
 	case d.options.StatusCodesBlacklistParsed.Length() > 0:
-		if !d.options.StatusCodesBlacklistParsed.Contains(wildcardResp) {
-			return &WildcardError{url: url.String(), statusCode: wildcardResp, length: wildcardLength, location: wildcardHeader.Get("Location")}
+		if !d.options.StatusCodesBlacklistParsed.Contains(wildcard.statusCode) {
+			return &WildcardError{url: wildcard.url.String(), statusCode: wildcard.statusCode, length: wildcard.length, location: wildcard.header.Get("Location")}
 		}
 	case d.options.StatusCodesParsed.Length() > 0:
-		if d.options.StatusCodesParsed.Contains(wildcardResp) {
-			return &WildcardError{url: url.String(), statusCode: wildcardResp, length: wildcardLength, location: wildcardHeader.Get("Location")}
+		if d.options.StatusCodesParsed.Contains(wildcard.statusCode) {
+			return &WildcardError{url: wildcard.url.String(), statusCode: wildcard.statusCode, length: wildcard.length, location: wildcard.header.Get("Location")}
 		}
 	default:
 		return errors.New("StatusCodes and StatusCodesBlacklist are both not set which should not happen")
 	}
 
 	return nil
+}
+
+func (d *GobusterDir) shouldReportStatus(statusCode int) bool {
+	if d.options.StatusCodesBlacklistParsed.Length() > 0 {
+		return !d.options.StatusCodesBlacklistParsed.Contains(statusCode)
+	}
+	if d.options.StatusCodesParsed.Length() > 0 {
+		return d.options.StatusCodesParsed.Contains(statusCode)
+	}
+	return false
 }
 
 func (d *GobusterDir) AdditionalSuccessWords(word string) []string {
@@ -252,9 +332,11 @@ func (d *GobusterDir) ProcessWord(ctx context.Context, word string, progress *li
 	var statusCode int
 	var size int64
 	var header http.Header
+	var body []byte
+	needBody := d.options.Soft404Detection || d.options.Cluster
 	for i := 1; i <= tries; i++ {
 		var err error
-		statusCode, size, header, _, err = d.http.Request(ctx, url, libgobuster.RequestOptions{})
+		statusCode, size, header, body, err = d.http.Request(ctx, url, libgobuster.RequestOptions{ReturnBody: needBody})
 		if err != nil {
 			// check if it's a timeout and if we should try again and try again
 			// otherwise the timeout error is raised
@@ -281,26 +363,28 @@ func (d *GobusterDir) ProcessWord(ctx context.Context, word string, progress *li
 	}
 
 	if statusCode != 0 {
-		resultStatus := false
-
-		switch {
-		case d.options.StatusCodesBlacklistParsed.Length() > 0:
-			if !d.options.StatusCodesBlacklistParsed.Contains(statusCode) {
-				resultStatus = true
-			}
-		case d.options.StatusCodesParsed.Length() > 0:
-			if d.options.StatusCodesParsed.Contains(statusCode) {
-				resultStatus = true
-			}
-		default:
+		resultStatus := d.shouldReportStatus(statusCode)
+		if d.options.StatusCodesBlacklistParsed.Length() == 0 && d.options.StatusCodesParsed.Length() == 0 {
 			return nil, errors.New("StatusCodes and StatusCodesBlacklist are both not set which should not happen")
 		}
 
 		if resultStatus && !d.options.ExcludeLengthParsed.Contains(int(size)) {
+			var fingerprint ResponseFingerprint
+			if needBody {
+				fingerprint = NewResponseFingerprint(statusCode, body, header, url.Path)
+				if d.soft404.Match(fingerprint) {
+					return nil, nil // nolint:nilnil
+				}
+			}
+
 			path := fmt.Sprintf("%-20s", entity)
 			if d.options.Expanded {
 				// expanded mode should show the full url
 				path = url.String()
+			}
+
+			if !d.claimResult(url.String()) {
+				return nil, nil // nolint:nilnil
 			}
 
 			r := Result{
@@ -308,6 +392,9 @@ func (d *GobusterDir) ProcessWord(ctx context.Context, word string, progress *li
 				Header:     header,
 				StatusCode: -1,
 				Size:       -1,
+			}
+			if d.options.Cluster {
+				r.ClusterID = d.resultClusters.Add(fingerprint)
 			}
 			if !d.options.NoStatus {
 				r.StatusCode = statusCode
@@ -320,6 +407,21 @@ func (d *GobusterDir) ProcessWord(ctx context.Context, word string, progress *li
 	}
 
 	return nil, nil // nolint:nilnil
+}
+
+func (d *GobusterDir) claimResult(key string) bool {
+	if !d.options.Deduplicate {
+		return true
+	}
+
+	d.resultMu.Lock()
+	defer d.resultMu.Unlock()
+
+	if _, found := d.seenResults[key]; found {
+		return false
+	}
+	d.seenResults[key] = struct{}{}
+	return true
 }
 
 // GetConfigString returns the string representation of the current config
@@ -372,6 +474,24 @@ func (d *GobusterDir) GetConfigString() (string, error) {
 
 	if len(o.ExcludeLength) > 0 {
 		if _, err := fmt.Fprintf(tw, "[+] Exclude Length:\t%s\n", d.options.ExcludeLengthParsed.Stringify()); err != nil {
+			return "", err
+		}
+	}
+
+	if o.Soft404Detection {
+		if _, err := fmt.Fprintf(tw, "[+] Soft 404 detection:\ttrue (threshold: %.2f)\n", o.Soft404Threshold); err != nil {
+			return "", err
+		}
+	}
+
+	if !o.Deduplicate {
+		if _, err := fmt.Fprintf(tw, "[+] Deduplicate:\tfalse\n"); err != nil {
+			return "", err
+		}
+	}
+
+	if o.Cluster {
+		if _, err := fmt.Fprintf(tw, "[+] Cluster similar results:\ttrue (threshold: %.2f)\n", o.ClusterThreshold); err != nil {
 			return "", err
 		}
 	}

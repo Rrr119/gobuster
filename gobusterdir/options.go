@@ -22,6 +22,11 @@ type OptionsDir struct {
 	ExcludeLength              string
 	ExcludeLengthParsed        libgobuster.Set[int]
 	Force                      bool
+	Soft404Detection           bool
+	Soft404Threshold           float64
+	Deduplicate                bool
+	Cluster                    bool
+	ClusterThreshold           float64
 }
 
 // NewOptions returns a new initialized OptionsDir
@@ -31,5 +36,10 @@ func NewOptions() *OptionsDir {
 		StatusCodesBlacklistParsed: libgobuster.NewSet[int](),
 		ExtensionsParsed:           libgobuster.NewSet[string](),
 		ExcludeLengthParsed:        libgobuster.NewSet[int](),
+		Soft404Detection:           true,
+		Soft404Threshold:           DefaultSoft404Threshold,
+		Deduplicate:                true,
+		Cluster:                    false,
+		ClusterThreshold:           DefaultClusterThreshold,
 	}
 }
